@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 
 import com.gitblit.Constants;
 import com.gitblit.Constants.AccountType;
+import com.gitblit.Constants.Role;
 import com.gitblit.Keys;
 import com.gitblit.auth.AuthenticationProvider.UsernamePasswordAuthenticationProvider;
 import com.gitblit.models.TeamModel;
@@ -38,6 +39,8 @@ import com.gitblit.service.LdapSyncService;
 import com.gitblit.utils.ArrayUtils;
 import com.gitblit.utils.StringUtils;
 import com.unboundid.ldap.sdk.Attribute;
+import com.unboundid.ldap.sdk.BindRequest;
+import com.unboundid.ldap.sdk.BindResult;
 import com.unboundid.ldap.sdk.DereferencePolicy;
 import com.unboundid.ldap.sdk.ExtendedResult;
 import com.unboundid.ldap.sdk.LDAPConnection;
@@ -106,8 +109,14 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		if (enabled) {
 			logger.info("Synchronizing with LDAP @ " + settings.getRequiredString(Keys.realm.ldap.server));
 			final boolean deleteRemovedLdapUsers = settings.getBoolean(Keys.realm.ldap.removeDeletedUsers, true);
-			LDAPConnection ldapConnection = getLdapConnection();
-			if (ldapConnection != null) {
+			LdapConnection ldapConnection = new LdapConnection();
+			if (ldapConnection.connect()) {
+				if (ldapConnection.bind() == null) {
+					ldapConnection.close();
+					logger.error("Cannot synchronize with LDAP.");
+					return;
+				}
+
 				try {
 					String accountBase = settings.getString(Keys.realm.ldap.accountBase, "");
 					String uidAttribute = settings.getString(Keys.realm.ldap.uid, "uid");
@@ -162,6 +171,8 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 							final Map<String, TeamModel> userTeams = new HashMap<String, TeamModel>();
 							for (UserModel user : ldapUsers.values()) {
 								for (TeamModel userTeam : user.teams) {
+									// Is this an administrative team?
+									setAdminAttribute(userTeam);
 									userTeams.put(userTeam.name, userTeam);
 								}
 							}
@@ -176,66 +187,6 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 				}
 			}
 		}
-	}
-
-	private LDAPConnection getLdapConnection() {
-		try {
-
-			URI ldapUrl = new URI(settings.getRequiredString(Keys.realm.ldap.server));
-			String ldapHost = ldapUrl.getHost();
-			int ldapPort = ldapUrl.getPort();
-			String bindUserName = settings.getString(Keys.realm.ldap.username, "");
-			String bindPassword = settings.getString(Keys.realm.ldap.password, "");
-
-			LDAPConnection conn;
-			if (ldapUrl.getScheme().equalsIgnoreCase("ldaps")) {
-				// SSL
-				SSLUtil sslUtil = new SSLUtil(new TrustAllTrustManager());
-				conn = new LDAPConnection(sslUtil.createSSLSocketFactory());
-				if (ldapPort == -1) {
-					ldapPort = 636;
-				}
-			} else if (ldapUrl.getScheme().equalsIgnoreCase("ldap") || ldapUrl.getScheme().equalsIgnoreCase("ldap+tls")) {
-				// no encryption or StartTLS
-				conn = new LDAPConnection();
-				 if (ldapPort == -1) {
-					 ldapPort = 389;
-				 }
-			} else {
-				logger.error("Unsupported LDAP URL scheme: " + ldapUrl.getScheme());
-				return null;
-			}
-
-			conn.connect(ldapHost, ldapPort);
-
-			if (ldapUrl.getScheme().equalsIgnoreCase("ldap+tls")) {
-				SSLUtil sslUtil = new SSLUtil(new TrustAllTrustManager());
-				ExtendedResult extendedResult = conn.processExtendedOperation(
-						new StartTLSExtendedRequest(sslUtil.createSSLContext()));
-				if (extendedResult.getResultCode() != ResultCode.SUCCESS) {
-					throw new LDAPException(extendedResult.getResultCode());
-				}
-			}
-
-			if (StringUtils.isEmpty(bindUserName) && StringUtils.isEmpty(bindPassword)) {
-				// anonymous bind
-				conn.bind(new SimpleBindRequest());
-			} else {
-				// authenticated bind
-				conn.bind(new SimpleBindRequest(bindUserName, bindPassword));
-			}
-
-			return conn;
-
-		} catch (URISyntaxException e) {
-			logger.error("Bad LDAP URL, should be in the form: ldap(s|+tls)://<server>:<port>", e);
-		} catch (GeneralSecurityException e) {
-			logger.error("Unable to create SSL Connection", e);
-		} catch (LDAPException e) {
-			logger.error("Error Connecting to LDAP", e);
-		}
-
-		return null;
 	}
 
 	/**
@@ -272,7 +223,6 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		return StringUtils.isEmpty(settings.getString(Keys.realm.ldap.email, ""));
 	}
 
-
 	/**
 	 * If the LDAP server will maintain team memberships then LdapUserService
 	 * will not allow team membership changes.  In this scenario all team
@@ -286,6 +236,26 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		return !settings.getBoolean(Keys.realm.ldap.maintainTeams, false);
 	}
 
+    @Override
+    public boolean supportsRoleChanges(UserModel user, Role role) {
+    	if (Role.ADMIN == role) {
+    		if (!supportsTeamMembershipChanges()) {
+				return false;
+    		}
+    	}
+        return true;
+    }
+
+	@Override
+	public boolean supportsRoleChanges(TeamModel team, Role role) {
+		if (Role.ADMIN == role) {
+    		if (!supportsTeamMembershipChanges()) {
+				return false;
+    		}
+    	}
+		return true;
+	}
+
 	@Override
 	public AccountType getAccountType() {
 		 return AccountType.LDAP;
@@ -295,23 +265,26 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 	public UserModel authenticate(String username, char[] password) {
 		String simpleUsername = getSimpleUsername(username);
 
-		LDAPConnection ldapConnection = getLdapConnection();
-		if (ldapConnection != null) {
+		LdapConnection ldapConnection = new LdapConnection();
+		if (ldapConnection.connect()) {
+
+			// Try to bind either to the "manager" account,
+			// or directly to the DN of the user logging in, if realm.ldap.bindpattern is configured.
+			String passwd = new String(password);
+			BindResult bindResult = null;
+			String bindPattern = settings.getString(Keys.realm.ldap.bindpattern, "");
+			if (! StringUtils.isEmpty(bindPattern)) {
+				bindResult = ldapConnection.bind(bindPattern, simpleUsername, passwd);
+			} else {
+				bindResult = ldapConnection.bind();
+			}
+			if (bindResult == null) {
+				ldapConnection.close();
+				return null;
+			}
+
+
 			try {
-				boolean alreadyAuthenticated = false;
-
-				String bindPattern = settings.getString(Keys.realm.ldap.bindpattern, "");
-				if (!StringUtils.isEmpty(bindPattern)) {
-					try {
-						String bindUser = StringUtils.replace(bindPattern, "${username}", escapeLDAPSearchFilter(simpleUsername));
-						ldapConnection.bind(bindUser, new String(password));
-
-						alreadyAuthenticated = true;
-					} catch (LDAPException e) {
-						return null;
-					}
-				}
-
 				// Find the logging in user's DN
 				String accountBase = settings.getString(Keys.realm.ldap.accountBase, "");
 				String accountPattern = settings.getString(Keys.realm.ldap.accountPattern, "(&(objectClass=person)(sAMAccountName=${username}))");
@@ -322,7 +295,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 					SearchResultEntry loggingInUser = result.getSearchEntries().get(0);
 					String loggingInUserDN = loggingInUser.getDN();
 
-					if (alreadyAuthenticated || isAuthenticated(ldapConnection, loggingInUserDN, new String(password))) {
+					if (ldapConnection.isAuthenticated(loggingInUserDN, passwd)) {
 						logger.debug("LDAP authenticated: " + username);
 
 						UserModel user = null;
@@ -334,7 +307,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 							}
 
 							// create a user cookie
-							setCookie(user, password);
+							setCookie(user);
 
 							if (!supportsTeamMembershipChanges()) {
 								getTeamsFromLdap(ldapConnection, simpleUsername, loggingInUser, user);
@@ -348,6 +321,8 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 
 							if (!supportsTeamMembershipChanges()) {
 								for (TeamModel userTeam : user.teams) {
+									// Is this an administrative team?
+									setAdminAttribute(userTeam);
 									updateTeam(userTeam);
 								}
 							}
@@ -378,12 +353,33 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 			if (!ArrayUtils.isEmpty(admins)) {
 				user.canAdmin = false;
 				for (String admin : admins) {
-					if (admin.startsWith("@") && user.isTeamMember(admin.substring(1))) {
-						// admin team
-						user.canAdmin = true;
-					} else if (user.getName().equalsIgnoreCase(admin)) {
+					if (user.getName().equalsIgnoreCase(admin)) {
 						// admin user
 						user.canAdmin = true;
+					}
+				}
+			}
+		}
+	}
+
+	/**
+	 * Set the canAdmin attribute for team retrieved from LDAP.
+	 * If we are not storing teams in LDAP and/or we have not defined any
+	 * administrator teams, then do not change the admin flag.
+	 *
+	 * @param team
+	 */
+	private void setAdminAttribute(TeamModel team) {
+		if (!supportsTeamMembershipChanges()) {
+			List<String> admins = settings.getStrings(Keys.realm.ldap.admins);
+			// if we have defined administrative teams, then set admin flag
+			// otherwise leave admin flag unchanged
+			if (!ArrayUtils.isEmpty(admins)) {
+				team.canAdmin = false;
+				for (String admin : admins) {
+					if (admin.startsWith("@") && team.name.equalsIgnoreCase(admin.substring(1))) {
+						// admin team
+						team.canAdmin = true;
 					}
 				}
 			}
@@ -436,7 +432,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		}
 	}
 
-	private void getTeamsFromLdap(LDAPConnection ldapConnection, String simpleUsername, SearchResultEntry loggingInUser, UserModel user) {
+	private void getTeamsFromLdap(LdapConnection ldapConnection, String simpleUsername, SearchResultEntry loggingInUser, UserModel user) {
 		String loggingInUserDN = loggingInUser.getDN();
 
 		// Clear the users team memberships - we're going to get them from LDAP
@@ -453,7 +449,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 			groupMemberPattern = StringUtils.replace(groupMemberPattern, "${" + userAttribute.getName() + "}", escapeLDAPSearchFilter(userAttribute.getValue()));
 		}
 
-		SearchResult teamMembershipResult = doSearch(ldapConnection, groupBase, true, groupMemberPattern, Arrays.asList("cn"));
+		SearchResult teamMembershipResult = searchTeamsInLdap(ldapConnection, groupBase, true, groupMemberPattern, Arrays.asList("cn"));
 		if (teamMembershipResult != null && teamMembershipResult.getEntryCount() > 0) {
 			for (int i = 0; i < teamMembershipResult.getEntryCount(); i++) {
 				SearchResultEntry teamEntry = teamMembershipResult.getSearchEntries().get(i);
@@ -470,12 +466,12 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		}
 	}
 
-	private void getEmptyTeamsFromLdap(LDAPConnection ldapConnection) {
+	private void getEmptyTeamsFromLdap(LdapConnection ldapConnection) {
 		logger.info("Start fetching empty teams from ldap.");
 		String groupBase = settings.getString(Keys.realm.ldap.groupBase, "");
 		String groupMemberPattern = settings.getString(Keys.realm.ldap.groupEmptyMemberPattern, "(&(objectClass=group)(!(member=*)))");
 
-		SearchResult teamMembershipResult = doSearch(ldapConnection, groupBase, true, groupMemberPattern, null);
+		SearchResult teamMembershipResult = searchTeamsInLdap(ldapConnection, groupBase, true, groupMemberPattern, null);
 		if (teamMembershipResult != null && teamMembershipResult.getEntryCount() > 0) {
 			for (int i = 0; i < teamMembershipResult.getEntryCount(); i++) {
 				SearchResultEntry teamEntry = teamMembershipResult.getSearchEntries().get(i);
@@ -485,6 +481,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 					TeamModel teamModel = userManager.getTeamModel(teamName);
 					if (teamModel == null) {
 						teamModel = createTeamFromLdap(teamEntry);
+						setAdminAttribute(teamModel);
 						userManager.updateTeamModel(teamModel);
 					}
 				}
@@ -492,6 +489,30 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		}
 		logger.info("Finished fetching empty teams from ldap.");
 	}
+
+
+	private SearchResult searchTeamsInLdap(LdapConnection ldapConnection, String base, boolean dereferenceAliases, String filter, List<String> attributes) {
+		SearchResult result = ldapConnection.search(base, dereferenceAliases, filter, attributes);
+		if (result == null) {
+			return null;
+		}
+
+		if (result.getResultCode() != ResultCode.SUCCESS) {
+			// Retry the search with user authorization in case we searched as a manager account that could not search for teams.
+			logger.debug("Rebinding as user to search for teams in LDAP");
+			result = null;
+			if (ldapConnection.rebindAsUser()) {
+				result = ldapConnection.search(base, dereferenceAliases, filter, attributes);
+				if (result.getResultCode() != ResultCode.SUCCESS) {
+					return null;
+				}
+				logger.info("Successful search after rebinding as user.");
+			}
+		}
+
+		return result;
+	}
+
 
 	private TeamModel createTeamFromLdap(SearchResultEntry teamEntry) {
 		TeamModel answer = new TeamModel(teamEntry.getAttributeValue("cn"));
@@ -501,47 +522,21 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		return answer;
 	}
 
-	private SearchResult doSearch(LDAPConnection ldapConnection, String base, String filter) {
-		try {
-			return ldapConnection.search(base, SearchScope.SUB, filter);
-		} catch (LDAPSearchException e) {
-			logger.error("Problem Searching LDAP", e);
-
-			return null;
-		}
-	}
-
-	private SearchResult doSearch(LDAPConnection ldapConnection, String base, boolean dereferenceAliases, String filter, List<String> attributes) {
+	private SearchResult doSearch(LdapConnection ldapConnection, String base, String filter) {
 		try {
 			SearchRequest searchRequest = new SearchRequest(base, SearchScope.SUB, filter);
-			if (dereferenceAliases) {
-				searchRequest.setDerefPolicy(DereferencePolicy.SEARCHING);
+			SearchResult result = ldapConnection.search(searchRequest);
+			if (result.getResultCode() != ResultCode.SUCCESS) {
+				return null;
 			}
-			if (attributes != null) {
-				searchRequest.setAttributes(attributes);
-			}
-			return ldapConnection.search(searchRequest);
-
-		} catch (LDAPSearchException e) {
-			logger.error("Problem Searching LDAP", e);
-
-			return null;
+			return result;
 		} catch (LDAPException e) {
 			logger.error("Problem creating LDAP search", e);
 			return null;
 		}
 	}
 
-	private boolean isAuthenticated(LDAPConnection ldapConnection, String userDn, String password) {
-		try {
-			// Binding will stop any LDAP-Injection Attacks since the searched-for user needs to bind to that DN
-			ldapConnection.bind(userDn, password);
-			return true;
-		} catch (LDAPException e) {
-			logger.error("Error authenticating user", e);
-			return false;
-		}
-	}
+
 
 	/**
 	 * Returns a simple username without any domain prefixes.
@@ -559,7 +554,7 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 	}
 
 	// From: https://www.owasp.org/index.php/Preventing_LDAP_Injection_in_Java
-	public static final String escapeLDAPSearchFilter(String filter) {
+	private static final String escapeLDAPSearchFilter(String filter) {
 		StringBuilder sb = new StringBuilder();
 		for (int i = 0; i < filter.length(); i++) {
 			char curChar = filter.charAt(i);
@@ -591,11 +586,233 @@ public class LdapAuthProvider extends UsernamePasswordAuthenticationProvider {
 		if (ldapSyncService.isReady()) {
 			long ldapSyncPeriod = getSynchronizationPeriodInMilliseconds();
 			int delay = 1;
-			logger.info("Ldap sync service will update users and groups every {} minutes.", ldapSyncPeriod);
+			logger.info("Ldap sync service will update users and groups every {} minutes.",
+					TimeUnit.MILLISECONDS.toMinutes(ldapSyncPeriod));
 			scheduledExecutorService.scheduleAtFixedRate(ldapSyncService, delay, ldapSyncPeriod,  TimeUnit.MILLISECONDS);
 		} else {
 			logger.info("Ldap sync service is disabled.");
 		}
 	}
 
+
+
+	private class LdapConnection {
+		private LDAPConnection conn;
+		private SimpleBindRequest currentBindRequest;
+		private SimpleBindRequest managerBindRequest;
+		private SimpleBindRequest userBindRequest;
+
+
+		public LdapConnection() {
+			String bindUserName = settings.getString(Keys.realm.ldap.username, "");
+			String bindPassword = settings.getString(Keys.realm.ldap.password, "");
+			if (StringUtils.isEmpty(bindUserName) && StringUtils.isEmpty(bindPassword)) {
+				this.managerBindRequest = new SimpleBindRequest();
+			}
+			this.managerBindRequest = new SimpleBindRequest(bindUserName, bindPassword);
+		}
+
+
+		boolean connect() {
+			try {
+				URI ldapUrl = new URI(settings.getRequiredString(Keys.realm.ldap.server));
+				String ldapHost = ldapUrl.getHost();
+				int ldapPort = ldapUrl.getPort();
+
+				if (ldapUrl.getScheme().equalsIgnoreCase("ldaps")) {
+					// SSL
+					SSLUtil sslUtil = new SSLUtil(new TrustAllTrustManager());
+					conn = new LDAPConnection(sslUtil.createSSLSocketFactory());
+					if (ldapPort == -1) {
+						ldapPort = 636;
+					}
+				} else if (ldapUrl.getScheme().equalsIgnoreCase("ldap") || ldapUrl.getScheme().equalsIgnoreCase("ldap+tls")) {
+					// no encryption or StartTLS
+					conn = new LDAPConnection();
+					 if (ldapPort == -1) {
+						 ldapPort = 389;
+					 }
+				} else {
+					logger.error("Unsupported LDAP URL scheme: " + ldapUrl.getScheme());
+					return false;
+				}
+
+				conn.connect(ldapHost, ldapPort);
+
+				if (ldapUrl.getScheme().equalsIgnoreCase("ldap+tls")) {
+					SSLUtil sslUtil = new SSLUtil(new TrustAllTrustManager());
+					ExtendedResult extendedResult = conn.processExtendedOperation(
+							new StartTLSExtendedRequest(sslUtil.createSSLContext()));
+					if (extendedResult.getResultCode() != ResultCode.SUCCESS) {
+						throw new LDAPException(extendedResult.getResultCode());
+					}
+				}
+
+				return true;
+
+			} catch (URISyntaxException e) {
+				logger.error("Bad LDAP URL, should be in the form: ldap(s|+tls)://<server>:<port>", e);
+			} catch (GeneralSecurityException e) {
+				logger.error("Unable to create SSL Connection", e);
+			} catch (LDAPException e) {
+				logger.error("Error Connecting to LDAP", e);
+			}
+
+			return false;
+		}
+
+
+		void close() {
+			if (conn != null) {
+				conn.close();
+			}
+		}
+
+
+		SearchResult search(SearchRequest request) {
+			try {
+				return conn.search(request);
+			} catch (LDAPSearchException e) {
+				logger.error("Problem Searching LDAP [{}]",  e.getResultCode());
+				return e.getSearchResult();
+			}
+		}
+
+
+		SearchResult search(String base, boolean dereferenceAliases, String filter, List<String> attributes) {
+			try {
+				SearchRequest searchRequest = new SearchRequest(base, SearchScope.SUB, filter);
+				if (dereferenceAliases) {
+					searchRequest.setDerefPolicy(DereferencePolicy.SEARCHING);
+				}
+				if (attributes != null) {
+					searchRequest.setAttributes(attributes);
+				}
+				SearchResult result = search(searchRequest);
+				return result;
+
+			} catch (LDAPException e) {
+				logger.error("Problem creating LDAP search", e);
+				return null;
+			}
+		}
+
+
+
+		/**
+		 * Bind using the manager credentials set in realm.ldap.username and ..password
+		 * @return A bind result, or null if binding failed.
+		 */
+		BindResult bind() {
+			BindResult result = null;
+			try {
+				result = conn.bind(managerBindRequest);
+				currentBindRequest = managerBindRequest;
+			} catch (LDAPException e) {
+				logger.error("Error authenticating to LDAP with manager account to search the directory.");
+				logger.error("  Please check your settings for realm.ldap.username and realm.ldap.password.");
+				logger.debug("  Received exception when binding to LDAP", e);
+				return null;
+			}
+			return result;
+		}
+
+
+		/**
+		 * Bind using the given credentials, by filling in the username in the given {@code bindPattern} to
+		 * create the DN.
+		 * @return A bind result, or null if binding failed.
+		 */
+		BindResult bind(String bindPattern, String simpleUsername, String password) {
+			BindResult result = null;
+			try {
+				String bindUser = StringUtils.replace(bindPattern, "${username}", escapeLDAPSearchFilter(simpleUsername));
+				SimpleBindRequest request = new SimpleBindRequest(bindUser, password);
+				result = conn.bind(request);
+				userBindRequest = request;
+				currentBindRequest = userBindRequest;
+			} catch (LDAPException e) {
+				logger.error("Error authenticating to LDAP with user account to search the directory.");
+				logger.error("  Please check your settings for realm.ldap.bindpattern.");
+				logger.debug("  Received exception when binding to LDAP", e);
+				return null;
+			}
+			return result;
+		}
+
+
+		boolean rebindAsUser() {
+			if (userBindRequest == null || currentBindRequest == userBindRequest) {
+				return false;
+			}
+			try {
+				conn.bind(userBindRequest);
+				currentBindRequest = userBindRequest;
+			} catch (LDAPException e) {
+				conn.close();
+				logger.error("Error rebinding to LDAP with user account.", e);
+				return false;
+			}
+			return true;
+		}
+
+
+		boolean isAuthenticated(String userDn, String password) {
+			verifyCurrentBinding();
+
+			// If the currently bound DN is already the DN of the logging in user, authentication has already happened
+			// during the previous bind operation. We accept this and return with the current bind left in place.
+			// This could also be changed to always retry binding as the logging in user, to make sure that the
+			// connection binding has not been tampered with in between. So far I see no way how this could happen
+			// and thus skip the repeated binding.
+			// This check also makes sure that the DN in realm.ldap.bindpattern actually matches the DN that was found
+			// when searching the user entry.
+			String boundDN = currentBindRequest.getBindDN();
+			if (boundDN != null && boundDN.equals(userDn)) {
+				return true;
+			}
+
+			// Bind a the logging in user to check for authentication.
+			// Afterwards, bind as the original bound DN again, to restore the previous authorization.
+			boolean isAuthenticated = false;
+			try {
+				// Binding will stop any LDAP-Injection Attacks since the searched-for user needs to bind to that DN
+				SimpleBindRequest ubr = new SimpleBindRequest(userDn, password);
+				conn.bind(ubr);
+				isAuthenticated = true;
+				userBindRequest = ubr;
+			} catch (LDAPException e) {
+				logger.error("Error authenticating user ({})", userDn, e);
+			}
+
+			try {
+				conn.bind(currentBindRequest);
+			} catch (LDAPException e) {
+				logger.error("Error reinstating original LDAP authorization (code {}). Team information may be inaccurate for this log in.",
+							e.getResultCode(), e);
+			}
+			return isAuthenticated;
+		}
+
+
+
+		private boolean verifyCurrentBinding() {
+			BindRequest lastBind = conn.getLastBindRequest();
+			if (lastBind == currentBindRequest) {
+				return true;
+			}
+			logger.debug("Unexpected binding in LdapConnection. {} != {}", lastBind, currentBindRequest);
+
+			String lastBoundDN = ((SimpleBindRequest)lastBind).getBindDN();
+			String boundDN = currentBindRequest.getBindDN();
+			logger.debug("Currently bound as '{}', check authentication for '{}'", lastBoundDN, boundDN);
+			if (boundDN != null && ! boundDN.equals(lastBoundDN)) {
+				logger.warn("Unexpected binding DN in LdapConnection. '{}' != '{}'.", lastBoundDN, boundDN);
+				logger.warn("Updated binding information in LDAP connection.");
+				currentBindRequest = (SimpleBindRequest)lastBind;
+				return false;
+			}
+			return true;
+		}
+	}
 }

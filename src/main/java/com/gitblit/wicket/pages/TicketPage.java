@@ -15,6 +15,7 @@
  */
 package com.gitblit.wicket.pages;
 
+import java.io.IOException;
 import java.text.DateFormat;
 import java.text.MessageFormat;
 import java.text.SimpleDateFormat;
@@ -42,11 +43,14 @@ import org.apache.wicket.markup.html.basic.Label;
 import org.apache.wicket.markup.html.image.ContextImage;
 import org.apache.wicket.markup.html.link.BookmarkablePageLink;
 import org.apache.wicket.markup.html.link.ExternalLink;
+import org.apache.wicket.markup.html.link.Link;
+import org.apache.wicket.markup.html.pages.RedirectPage;
 import org.apache.wicket.markup.html.panel.Fragment;
 import org.apache.wicket.markup.repeater.Item;
 import org.apache.wicket.markup.repeater.data.DataView;
 import org.apache.wicket.markup.repeater.data.ListDataProvider;
 import org.apache.wicket.model.Model;
+import org.apache.wicket.protocol.http.RequestUtils;
 import org.apache.wicket.protocol.http.WebRequest;
 import org.eclipse.jgit.diff.DiffEntry.ChangeType;
 import org.eclipse.jgit.lib.PersonIdent;
@@ -82,16 +86,19 @@ import com.gitblit.tickets.TicketResponsible;
 import com.gitblit.utils.ArrayUtils;
 import com.gitblit.utils.JGitUtils;
 import com.gitblit.utils.JGitUtils.MergeStatus;
+import com.gitblit.utils.CommitCache;
 import com.gitblit.utils.MarkdownUtils;
+import com.gitblit.utils.RefLogUtils;
 import com.gitblit.utils.StringUtils;
 import com.gitblit.utils.TimeUtils;
 import com.gitblit.wicket.GitBlitWebSession;
 import com.gitblit.wicket.TicketsUI;
 import com.gitblit.wicket.WicketUtils;
+import com.gitblit.wicket.panels.AvatarImage;
+import com.gitblit.wicket.panels.BasePanel.JavascriptEventConfirmation;
 import com.gitblit.wicket.panels.BasePanel.JavascriptTextPrompt;
 import com.gitblit.wicket.panels.CommentPanel;
 import com.gitblit.wicket.panels.DiffStatPanel;
-import com.gitblit.wicket.panels.GravatarImage;
 import com.gitblit.wicket.panels.IconAjaxLink;
 import com.gitblit.wicket.panels.LinkPanel;
 import com.gitblit.wicket.panels.ShockWaveComponent;
@@ -312,7 +319,7 @@ public class TicketPage extends RepositoryPage {
 					if (user == null) {
 						user = new UserModel(username);
 					}
-					item.add(new GravatarImage("participant", user.getDisplayName(),
+					item.add(new AvatarImage("participant", user.getDisplayName(),
 							user.emailAddress, null, 25, true));
 				}
 			};
@@ -519,6 +526,10 @@ public class TicketPage extends RepositoryPage {
 		 * TICKET METADATA
 		 */
 		add(new Label("ticketType", ticket.type.toString()));
+
+		add(new Label("priority", ticket.priority.toString()));
+		add(new Label("severity", ticket.severity.toString()));
+
 		if (StringUtils.isEmpty(ticket.topic)) {
 			add(new Label("ticketTopic").setVisible(false));
 		} else {
@@ -527,6 +538,8 @@ public class TicketPage extends RepositoryPage {
 			String safeTopic = app().xssFilter().relaxed(topic);
 			add(new Label("ticketTopic", safeTopic).setEscapeModelStrings(false));
 		}
+
+
 
 
 		/*
@@ -730,7 +743,7 @@ public class TicketPage extends RepositoryPage {
 		} else {
 			// permit user to comment
 			Fragment newComment = new Fragment("newComment", "newCommentFragment", this);
-			GravatarImage img = new GravatarImage("newCommentAvatar", user.username, user.emailAddress,
+			AvatarImage img = new AvatarImage("newCommentAvatar", user.username, user.emailAddress,
 					"gravatar-round", avatarWidth, true);
 			newComment.add(img);
 			CommentPanel commentPanel = new CommentPanel("commentPanel", user, ticket, null, TicketsPage.class);
@@ -746,7 +759,7 @@ public class TicketPage extends RepositoryPage {
 		if (currentPatchset == null) {
 			// no patchset available
 			RepositoryUrl repoUrl = getRepositoryUrl(user, repository);
-			boolean canPropose = repoUrl != null && repoUrl.permission.atLeast(AccessPermission.CLONE) && !UserModel.ANONYMOUS.equals(user);
+			boolean canPropose = repoUrl != null && repoUrl.hasPermission() && repoUrl.permission.atLeast(AccessPermission.CLONE) && !UserModel.ANONYMOUS.equals(user);
 			if (ticket.isOpen() && app().tickets().isAcceptingNewPatchsets(repository) && canPropose) {
 				// ticket & repo will accept a proposal patchset
 				// show the instructions for proposing a patchset
@@ -810,14 +823,14 @@ public class TicketPage extends RepositoryPage {
 				public void populateItem(final Item<RevCommit> item) {
 					RevCommit commit = item.getModelObject();
 					PersonIdent author = commit.getAuthorIdent();
-					item.add(new GravatarImage("authorAvatar", author.getName(), author.getEmailAddress(), null, 16, false));
+					item.add(new AvatarImage("authorAvatar", author.getName(), author.getEmailAddress(), null, 16, false));
 					item.add(new Label("author", commit.getAuthorIdent().getName()));
 					item.add(new LinkPanel("commitId", null, getShortObjectId(commit.getName()),
 							CommitPage.class, WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
 					item.add(new LinkPanel("diff", "link", getString("gb.diff"), CommitDiffPage.class,
 							WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
 					item.add(new Label("title", StringUtils.trimString(commit.getShortMessage(), Constants.LEN_SHORTLOG_REFS)));
-					item.add(WicketUtils.createDateLabel("commitDate", JGitUtils.getCommitDate(commit), GitBlitWebSession
+					item.add(WicketUtils.createDateLabel("commitDate", JGitUtils.getAuthorDate(commit), GitBlitWebSession
 							.get().getTimezone(), getTimeUtils(), false));
 					item.add(new DiffStatPanel("commitDiffStat", 0, 0, true));
 				}
@@ -864,6 +877,7 @@ public class TicketPage extends RepositoryPage {
 					LinkPanel psr = new LinkPanel("patchsetRevision", null, patchset.number + "-" + patchset.rev,
 							ComparePage.class, WicketUtils.newRangeParameter(repositoryName, patchset.parent == null ? patchset.base : patchset.parent, patchset.tip), true);
 					WicketUtils.setHtmlTooltip(psr, patchset.toString());
+					WicketUtils.setCssClass(psr, "aui-lozenge aui-lozenge-subtle");
 					item.add(psr);
 					String typeCss = getPatchsetTypeCss(patchset.type);
 					Label typeLabel = new Label("patchsetType", patchset.type.toString());
@@ -874,6 +888,14 @@ public class TicketPage extends RepositoryPage {
 					}
 					item.add(typeLabel);
 
+					Link<Void> deleteLink = createDeletePatchsetLink(repository, patchset);
+					
+					if (user.canDeleteRef(repository)) {
+						item.add(deleteLink.setVisible(patchset.canDelete));
+					} else {
+						item.add(deleteLink.setVisible(false));
+					}
+
 					// show commit diffstat
 					item.add(new DiffStatPanel("patchsetDiffStat", patchset.insertions, patchset.deletions, patchset.rev > 1));
 				} else if (event.hasComment()) {
@@ -881,6 +903,43 @@ public class TicketPage extends RepositoryPage {
 					item.add(new Label("what", getString("gb.commented")));
 					item.add(new Label("patchsetRevision").setVisible(false));
 					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
+					item.add(new Label("patchsetDiffStat").setVisible(false));
+				} else if (event.hasReference()) {
+					// reference
+					switch (event.reference.getSourceType()) {
+						case Commit: {
+							final int shaLen = app().settings().getInteger(Keys.web.shortCommitIdLength, 6);
+							
+							item.add(new Label("what", getString("gb.referencedByCommit")));
+							LinkPanel psr = new LinkPanel("patchsetRevision", null, event.reference.toString().substring(0, shaLen),
+									CommitPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.toString()), true);
+							WicketUtils.setHtmlTooltip(psr, event.reference.toString());
+							WicketUtils.setCssClass(psr, "ticketReference-commit shortsha1");
+							item.add(psr);
+							
+						} break;
+						
+						case Ticket: {
+							final String text = MessageFormat.format("ticket/{0}", event.reference.ticketId);
+
+							item.add(new Label("what", getString("gb.referencedByTicket")));
+							//NOTE: Ideally reference the exact comment using reference.toString,
+							//		however anchor hash is used and is escaped resulting in broken link
+							LinkPanel psr = new LinkPanel("patchsetRevision", null,  text,
+									TicketsPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.ticketId.toString()), true);
+							WicketUtils.setCssClass(psr, "ticketReference-comment");
+							item.add(psr);
+						} break;
+					
+						default: {
+							item.add(new Label("what").setVisible(false));
+							item.add(new Label("patchsetRevision").setVisible(false));
+						}
+					}
+					
+					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
 					item.add(new Label("patchsetDiffStat").setVisible(false));
 				} else if (event.hasReview()) {
 					// review
@@ -900,11 +959,13 @@ public class TicketPage extends RepositoryPage {
 							.setEscapeModelStrings(false));
 					item.add(new Label("patchsetRevision").setVisible(false));
 					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
 					item.add(new Label("patchsetDiffStat").setVisible(false));
 				} else {
 					// field change
 					item.add(new Label("patchsetRevision").setVisible(false));
 					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
 					item.add(new Label("patchsetDiffStat").setVisible(false));
 
 					String what = "";
@@ -981,12 +1042,12 @@ public class TicketPage extends RepositoryPage {
 		UserModel commenter = app().users().getUserModel(entry.author);
 		if (commenter == null) {
 			// unknown user
-			container.add(new GravatarImage("changeAvatar", entry.author,
+			container.add(new AvatarImage("changeAvatar", entry.author,
 					entry.author, null, avatarSize, false).setVisible(avatarSize > 0));
 			container.add(new Label("changeAuthor", entry.author.toLowerCase()));
 		} else {
 			// known user
-			container.add(new GravatarImage("changeAvatar", commenter.getDisplayName(),
+			container.add(new AvatarImage("changeAvatar", commenter.getDisplayName(),
 					commenter.emailAddress, avatarSize > 24 ? "gravatar-round" : null,
 							avatarSize, true).setVisible(avatarSize > 0));
 			container.add(new LinkPanel("changeAuthor", null, commenter.getDisplayName(),
@@ -1344,14 +1405,14 @@ public class TicketPage extends RepositoryPage {
 
 		boolean allowMerge;
 		if (repository.requireApproval) {
-			// rpeository requires approval
+			// repository requires approval
 			allowMerge = ticket.isOpen() && ticket.isApproved(patchset);
 		} else {
-			// vetos are binding
+			// vetoes are binding
 			allowMerge = ticket.isOpen() && !ticket.isVetoed(patchset);
 		}
 
-		MergeStatus mergeStatus = JGitUtils.canMerge(getRepository(), patchset.tip, ticket.mergeTo);
+		MergeStatus mergeStatus = JGitUtils.canMerge(getRepository(), patchset.tip, ticket.mergeTo, repository.mergeType);
 		if (allowMerge) {
 			if (MergeStatus.MERGEABLE == mergeStatus) {
 				// patchset can be cleanly merged to integration branch OR has already been merged
@@ -1424,6 +1485,12 @@ public class TicketPage extends RepositoryPage {
 				// patchset already merged
 				Fragment mergePanel = new Fragment("mergePanel", "alreadyMergedFragment", this);
 				mergePanel.add(new Label("mergeTitle", MessageFormat.format(getString("gb.patchsetAlreadyMerged"), ticket.mergeTo)));
+				return mergePanel;
+			} else if (MergeStatus.MISSING_INTEGRATION_BRANCH == mergeStatus) {
+				// target/integration branch is missing
+				Fragment mergePanel = new Fragment("mergePanel", "notMergeableFragment", this);
+				mergePanel.add(new Label("mergeTitle", MessageFormat.format(getString("gb.patchsetNotMergeable"), ticket.mergeTo)));
+				mergePanel.add(new Label("mergeMore", MessageFormat.format(getString("gb.missingIntegrationBranchMore"), ticket.mergeTo)));
 				return mergePanel;
 			} else {
 				// patchset can not be cleanly merged
@@ -1503,7 +1570,7 @@ public class TicketPage extends RepositoryPage {
 	 */
 	protected RepositoryUrl getRepositoryUrl(UserModel user, RepositoryModel repository) {
 		HttpServletRequest req = ((WebRequest) getRequest()).getHttpServletRequest();
-		List<RepositoryUrl> urls = app().gitblit().getRepositoryUrls(req, user, repository);
+		List<RepositoryUrl> urls = app().services().getRepositoryUrls(req, user, repository);
 		if (ArrayUtils.isEmpty(urls)) {
 			return null;
 		}
@@ -1588,4 +1655,85 @@ public class TicketPage extends RepositoryPage {
 			return copyFragment;
 		}
 	}
+	
+	private Link<Void> createDeletePatchsetLink(final RepositoryModel repositoryModel, final Patchset patchset)
+	{
+		Link<Void> deleteLink = new Link<Void>("deleteRevision") {
+			private static final long serialVersionUID = 1L;
+
+			@Override
+			public void onClick() {
+				Repository r = app().repositories().getRepository(repositoryModel.name);
+				UserModel user = GitBlitWebSession.get().getUser();
+				
+				if (r == null) {
+					if (app().repositories().isCollectingGarbage(repositoryModel.name)) {
+						error(MessageFormat.format(getString("gb.busyCollectingGarbage"), repositoryModel.name));
+					} else {
+						error(MessageFormat.format("Failed to find repository {0}", repositoryModel.name));
+					}
+					return;
+				}
+				
+				//Construct the ref name based on the patchset
+				String ticketShard = String.format("%02d", ticket.number);
+				ticketShard = ticketShard.substring(ticketShard.length() - 2);
+				final String refName = String.format("%s%s/%d/%d", Constants.R_TICKETS_PATCHSETS, ticketShard, ticket.number, patchset.number);
+
+				Ref ref = null;
+				boolean success = true;
+				
+				try {
+					ref = r.getRef(refName);
+					
+					if (ref != null) {
+						success = JGitUtils.deleteBranchRef(r, ref.getName());
+					} else {
+						success = false;
+					}
+					
+					if (success) {
+						// clear commit cache
+						CommitCache.instance().clear(repositoryModel.name, refName);
+
+						// optionally update reflog
+						if (RefLogUtils.hasRefLogBranch(r)) {
+							RefLogUtils.deleteRef(user, r, ref);
+						}
+
+						TicketModel updatedTicket = app().tickets().deletePatchset(ticket, patchset, user.username);
+												
+						if (updatedTicket == null) {
+							success = false;
+						}
+					}
+				} catch (IOException e) {
+					logger().error("failed to determine ticket from ref", e);
+					success = false;
+				} finally {
+					r.close();
+				}
+
+				if (success) {
+					getSession().info(MessageFormat.format(getString("gb.deletePatchsetSuccess"), patchset.number));
+					logger().info(MessageFormat.format("{0} deleted patchset {1} from ticket {2}", 
+							user.username, patchset.number, ticket.number));
+				} else {
+					getSession().error(MessageFormat.format(getString("gb.deletePatchsetFailure"),patchset.number));
+				}
+				
+				//Force reload of the page to rebuild ticket change cache
+				String relativeUrl = urlFor(TicketsPage.class, getPageParameters()).toString();
+				String absoluteUrl = RequestUtils.toAbsolutePath(relativeUrl);
+				setResponsePage(new RedirectPage(absoluteUrl));
+			}
+		};
+
+		WicketUtils.setHtmlTooltip(deleteLink, MessageFormat.format(getString("gb.deletePatchset"), patchset.number));
+		
+		deleteLink.add(new JavascriptEventConfirmation("onclick", MessageFormat.format(getString("gb.deletePatchset"), patchset.number)));
+		
+		return deleteLink;
+	}
+	
 }
